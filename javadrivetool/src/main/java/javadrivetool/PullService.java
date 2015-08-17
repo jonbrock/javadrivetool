@@ -2,14 +2,18 @@ package javadrivetool;
 
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.nio.channels.ReadableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.UserDefinedFileAttributeView;
+import java.security.MessageDigest;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import org.apache.commons.codec.binary.Hex;
 
 import com.google.api.services.drive.Drive;
 import com.google.api.services.drive.model.File;
@@ -25,10 +29,12 @@ public class PullService {
 	private ExecutorService downloadService;
 	
 	private static class LocalFileResolution {
+		public boolean exists;
 		public Path path;
 		public JavaDriveToolMetaDataV1 metadata;
 		
-		public LocalFileResolution(Path path, JavaDriveToolMetaDataV1 metadata) {
+		public LocalFileResolution(boolean exists, Path path, JavaDriveToolMetaDataV1 metadata) {
+			this.exists = exists;
 			this.path = path;
 			this.metadata = metadata;
 		}
@@ -52,7 +58,7 @@ public class PullService {
 				Path testPath = parentPath.resolve(testFilename);
 				
 				/* If it doesn't exist, we're done. */
-				if (!Files.exists(testPath)) return new LocalFileResolution(testPath, null);
+				if (!Files.exists(testPath)) return new LocalFileResolution(false, testPath, null);
 				
 				/* If it does exist, see if it's the same as the remote file. */
 				JavaDriveToolMetaDataV1 metadata = null;
@@ -71,13 +77,13 @@ public class PullService {
 				/* If there's no metadata, we're overwriting so we're done. */
 				if (metadata == null || metadata.getFileId() == null) {
 					System.out.println("Local file found without metadata, overwriting");
-					return new LocalFileResolution(testPath, null);
+					return new LocalFileResolution(true, testPath, null);
 				}
 				
 				/* If the file id matches, we're done. */
 				if (metadata != null && metadata.getFileId() != null && metadata.getFileId().equals(remoteFile.getId())) {
 					System.out.println("Local file found with matching metadata: " + testPath);
-					return new LocalFileResolution(testPath, metadata);
+					return new LocalFileResolution(true, testPath, metadata);
 				}
 				
 				/* Otherwise keep looking. */
@@ -98,7 +104,6 @@ public class PullService {
 		}
 		
 		public void run() {
-			System.out.println("ListRemoteFilesTask for " + parentId + " in " + parentPath);
 			try {
 				Drive.Files.List request = drive.files().list().setQ("trashed = false and '" + parentId + "' in parents").setMaxResults(100);
 				do {
@@ -131,13 +136,27 @@ public class PullService {
 							
 							LocalFileResolution localFile = resolveLocalFile(remoteFile, title);
 							
+							if (Config.pullComputeMd5 && localFile.exists && (localFile.metadata == null || localFile.metadata.getMd5() == null)) {
+								CheckMd5Task subtask = new CheckMd5Task(remoteFile, localFile.path);
+								checkMd5Service.execute(subtask);
+								continue;
+							}
+							
 							if (localFile.metadata != null && localFile.metadata.getMd5() != null && remoteFile.getMd5Checksum() != null && localFile.metadata.getMd5().equals(remoteFile.getMd5Checksum())) {
 								long localSize = Files.size(localFile.path);
 								long localTime = Files.getLastModifiedTime(localFile.path).toMillis();
 								
-								if (localSize == remoteFile.getFileSize() && remoteFile.getModifiedDate().getValue() == localTime) {
-									System.out.println("ID, MD5, size, and LastModifiedTime match, skipping download of " + localFile.path);
-									continue;
+								if (localSize == remoteFile.getFileSize()) {
+									if (remoteFile.getModifiedDate().getValue() == localTime) {
+										System.out.println("ID, MD5, size, and LastModifiedTime match, skipping download of " + localFile.path);
+										continue;
+									}
+									if (Config.pullComputeMd5) {
+										System.out.println("ID, MD5, size match, but LastModifiedTime does not match, checking local MD5 of " + localFile.path);
+										CheckMd5Task subtask = new CheckMd5Task(remoteFile, localFile.path);
+										checkMd5Service.execute(subtask);
+										continue;
+									}
 								}
 							}
 							
@@ -146,7 +165,6 @@ public class PullService {
 						}
 					}
 				} while (request.getPageToken() != null && !request.getPageToken().isEmpty());
-				System.out.println("Done with ListRemoteFilesTask in " + parentPath);
 			}
 			catch (Exception e) {
 				System.out.println("Error in ListRemoteFilesTask");
@@ -159,11 +177,50 @@ public class PullService {
 	 * If they don't match, we need to download the remote file.
 	 */
 	private class CheckMd5Task implements Runnable {
-		private Path localFile;
-		private String remoteMd5;
+		private File remoteFile;
+		private Path localPath;
+		private ByteBuffer byteBuffer = ByteBuffer.allocate(16 * 1024);
+		
+		public CheckMd5Task(File remoteFile, Path localPath) {
+			this.remoteFile = remoteFile;
+			this.localPath = localPath;
+		}
 		
 		public void run() {
-			
+			System.out.println("Computing MD5 of " + localPath);
+			try {
+				MessageDigest md = MessageDigest.getInstance("MD5");
+				ReadableByteChannel in = Files.newByteChannel(localPath);
+				byteBuffer.clear();
+				while (in.read(byteBuffer) != -1) {
+					byteBuffer.flip();
+					md.update(byteBuffer);
+					byteBuffer.clear();
+				}
+				String fileMd5 = new String(Hex.encodeHex(md.digest()));
+				if (fileMd5.equalsIgnoreCase(remoteFile.getMd5Checksum())) {
+					System.out.println("MD5 matches, adding metadata");
+					/* We have the file locally without the metadata. Just add the metadata. */
+					JavaDriveToolMetaDataV1 metadata = new JavaDriveToolMetaDataV1();
+					metadata.setFileId(remoteFile.getId());
+					metadata.setMd5(remoteFile.getMd5Checksum());
+					Gson gson = new Gson();
+					String data = gson.toJson(metadata);
+					UserDefinedFileAttributeView view = Files.getFileAttributeView(localPath, UserDefinedFileAttributeView.class);
+					view.write("javadrivetool", StandardCharsets.UTF_8.encode(data));
+					
+					/* Set timestamp. */
+					Files.setLastModifiedTime(localPath, FileTime.fromMillis(remoteFile.getModifiedDate().getValue()));
+				}
+				else {
+					/* MD5 does not match, download the file. */
+					DownloadFileTask subtask = new DownloadFileTask(remoteFile, localPath);
+					downloadService.execute(subtask);
+				}
+			}
+			catch (Exception e) {
+				System.out.println("Error in CheckMd5Task: " + e.getMessage());
+			}
 		}
 	}
 	
@@ -218,7 +275,7 @@ public class PullService {
 		this.drive = drive;
 		this.localRoot = localRoot;
 		listRemoteFilesService = Executors.newFixedThreadPool(1);
-		//checkMd5Service = Executors.newFixedThreadPool(3);
+		if (Config.pullComputeMd5) checkMd5Service = Executors.newFixedThreadPool(2);
 		downloadService = Executors.newFixedThreadPool(4);
 	}
 	
